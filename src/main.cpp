@@ -1,9 +1,14 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <TinyGPS++.h>
-#include <WiFi.h>
 #include <FirebaseESP32.h>
 #include <ESP_Mail_Client.h>
+
+#if defined(ESP32)
+  #include <WiFi.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#endif
 
 // RTC, GPS and WiFi credentials
 RTC_DS1307 rtc;
@@ -24,13 +29,16 @@ FirebaseData firebaseData;
 #define EMAIL_SENDER "you@gmail.com"
 #define EMAIL_SENDER_PASSWORD "your_password"
 #define EMAIL_RECIPIENT ""
+SMTPSession smtp;
 
 // GPS pins
 #define RX2 16
 #define TX2 17
 
-SMTPData smtpData;
+
+// SMTPData smtpData;
 ESP_Mail_Client mailClient;
+ESP_Mail_Session session;
 
 void setup() {  
   Serial.begin(115200);
@@ -63,11 +71,14 @@ void setup() {
   // Initialize Firebase
   Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
 
-  // Initialize Email
-  mailClient.setLogin(SMTP_HOST, SMTP_PORT, EMAIL_SENDER, EMAIL_SENDER_PASSWORD);
-  mailClient.setSender("ESP32", EMAIL_SENDER);
-  mailClient.setPriority("High");
-  mailClient.setSubject("Coordinates Alert");
+  smtp.callback(smtpCallback);
+
+  /* Set the session config */
+  session.server.host_name = SMTP_HOST;
+  session.server.port = SMTP_PORT;
+  session.login.email = EMAIL_SENDER;
+  session.login.password = EMAIL_SENDER_PASSWORD;
+  session.login.user_domain = "";
 }
 
 static uint32_t lastCheck = uint32_t(0);
@@ -114,23 +125,71 @@ void task() {
     // Compare coordinates
     double distance = TinyGPSPlus::distanceBetween(currentLat, currentLng, firebaseLat, firebaseLng);
     if (distance >= 5) {
-      // Send email
-      String message = "Current coordinates: " + String(currentLat, 6) + ", " + String(currentLng, 6) +
-                       "\nFirebase coordinates: " + String(firebaseLat, 6) + ", " + String(firebaseLng, 6) +
-                       "\nDifference: " + String(distance) + " meters";
-     mailClient.setMessage(message.c_str(), message.length());
-     mailClient.addRecipient(EMAIL_RECIPIENT);
-     mailClient.send(smtpData);
-     smtpData.empty();
-
-        Serial.println("Over 5m away");
-        Serial.println(message);
+      if (!sendEmail(currentLat, currentLng, firebaseLat, firebaseLng, distance)) {
+        Serial.println("Faield sending Email");
+      }
     }
 
-    String maps = "https://www.google.com/maps/@" + String(currentLat, 6) + "," + String(currentLng, 6);
-    
     // Update Firebase
     Firebase.setFloat(firebaseData, "/coordinates/latitude", currentLat);
     Firebase.setFloat(firebaseData, "/coordinates/longitude", currentLng);
+    String maps = "https://www.google.com/maps/@" + String(currentLat, 7) + "," + String(currentLng, 7);
     Firebase.setString(firebaseData, "/coordinates/maps", maps);
+}
+
+bool sendEmail(double currentLat, double currentLng, double firebaseLat, double firebaseLng, double distance) {
+  SMTP_Message message;
+  String messageStr = "Current coordinates: " + String(currentLat, 7) + ", " + String(currentLng, 7) +
+                   "\nFirebase coordinates: " + String(firebaseLat, 7) + ", " + String(firebaseLng, 7) +
+                   "\nDifference: " + String(distance) + " meters";
+  /* Set the message headers */
+  message.sender.name = "ESP";
+  message.sender.email = EMAIL_SENDER;
+  message.subject = "ESP Test Email";
+  message.addRecipient("Sara", EMAIL_RECIPIENT);
+  /*Send HTML message*/
+  String htmlMsg = "<div style=\"color:#2f4468;\"><h1>Hello World!</h1><p>- Sent from ESP board</p></div>";
+  message.html.content = htmlMsg.c_str();
+  message.html.content = htmlMsg.c_str();
+  message.text.charSet = "us-ascii";
+  message.html.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+  Serial.println("Over 5m away");
+  Serial.println(messageStr);
+  if (!smtp.connect(&session)) {
+      return false;
+  }
+  if (!MailClient.sendMail(&smtp, &message)) {
+    Serial.println("Error sending Email, " + smtp.errorReason());
+    return false;
+  }
+
+  return true;
+}
+
+void smtpCallback(SMTP_Status status){
+  /* Print the current status */
+  Serial.println(status.info());
+
+  /* Print the sending result */
+  if (status.success()){
+    Serial.println("----------------");
+    ESP_MAIL_PRINTF("Message sent success: %d\n", status.completedCount());
+    ESP_MAIL_PRINTF("Message sent failled: %d\n", status.failedCount());
+    Serial.println("----------------\n");
+    struct tm dt;
+
+    for (size_t i = 0; i < smtp.sendingResult.size(); i++){
+      /* Get the result item */
+      SMTP_Result result = smtp.sendingResult.getItem(i);
+      time_t ts = (time_t)result.timestamp;
+      localtime_r(&ts, &dt);
+
+      ESP_MAIL_PRINTF("Message No: %d\n", i + 1);
+      ESP_MAIL_PRINTF("Status: %s\n", result.completed ? "success" : "failed");
+      ESP_MAIL_PRINTF("Date/Time: %d/%d/%d %d:%d:%d\n", dt.tm_year + 1900, dt.tm_mon + 1, dt.tm_mday, dt.tm_hour, dt.tm_min, dt.tm_sec);
+      ESP_MAIL_PRINTF("Recipient: %s\n", result.recipients.c_str());
+      ESP_MAIL_PRINTF("Subject: %s\n", result.subject.c_str());
+    }
+    Serial.println("----------------\n");
+  }
 }
