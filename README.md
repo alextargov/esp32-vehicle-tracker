@@ -1,0 +1,1 @@
+Minimal GPS tracker using ESP32, RTC DS1307 and a GPS module Neo6M. 
