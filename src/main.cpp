@@ -1,195 +1,304 @@
+#include <Arduino.h>
 #include <Wire.h>
 #include <RTClib.h>
 #include <TinyGPS++.h>
 #include <FirebaseESP32.h>
 #include <ESP_Mail_Client.h>
 
-#if defined(ESP32)
-  #include <WiFi.h>
-#elif defined(ESP8266)
-  #include <ESP8266WiFi.h>
-#endif
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
 
-// RTC, GPS and WiFi credentials
+// WiFi credentials
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
+// Email credentials and settings
+#define SMTP_HOST "smtp.gmail.com"
+#define SMTP_PORT esp_mail_smtp_port_465
+#define AUTHOR_EMAIL ""
+#define AUTHOR_PASSWORD ""
+#define RECIPIENT_EMAIL ""
+
+SMTPSession smtp;
+
+Session_Config config;
+
+void smtpCallback(SMTP_Status status);
+
+#include "HeapStat.h"
+HeapStat heapInfo;
+
+// RTC, GPS
 RTC_DS1307 rtc;
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(1);
-
-const char* ssid = "";
-const char* password = "";
+#define DISTANCE 1
 
 // Firebase credentials
 #define FIREBASE_HOST ""
 #define FIREBASE_AUTH ""
+#define FIREBASE_USER ""
+#define FIREBASE_PASSOWRD ""
+#define FIREBASE_DATABASE_SECRET ""
+#define FIREBASE_ROOT_PATH "/"
 FirebaseData firebaseData;
-
-// Email credentials and settings
-#define SMTP_HOST "smtp.gmail.com"
-#define SMTP_PORT 465
-#define EMAIL_SENDER "you@gmail.com"
-#define EMAIL_SENDER_PASSWORD "your_password"
-#define EMAIL_RECIPIENT ""
-SMTPSession smtp;
+FirebaseAuth firebaseAuth;
+FirebaseConfig firebaseConfig;
 
 // GPS pins
 #define RX2 16
 #define TX2 17
 
+void firebaseSignIn(const char *email, const char *password) {
+    firebaseAuth.user.email = email;
+    firebaseAuth.user.password = password;
 
-// SMTPData smtpData;
-ESP_Mail_Client mailClient;
-ESP_Mail_Session session;
+    /* Reset stored authen and config */
+    Firebase.reset(&firebaseConfig);
 
-void setup() {  
-  Serial.begin(115200);
-  SerialGPS.begin(9600, SERIAL_8N1, RX2, TX2);
+    /* Initialize the library with the Firebase authen and config */
+    Firebase.begin(&firebaseConfig, &firebaseAuth);
 
-  #ifndef ESP8266
-    while (!Serial);
-  #endif
-
-  // Connect to WiFi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("WiFi connected");
-
-  if (!rtc.begin()) {
-    Serial.println("Couldn't find RTC");
-    Serial.flush();
-    while (1) delay(10);
-  }
-
-  if (!rtc.isrunning()) {
-    Serial.println("RTC is NOT running, let's set the time!");
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-
-  }
-
-  // Initialize Firebase
-  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
-
-  smtp.callback(smtpCallback);
-
-  /* Set the session config */
-  session.server.host_name = SMTP_HOST;
-  session.server.port = SMTP_PORT;
-  session.login.email = EMAIL_SENDER;
-  session.login.password = EMAIL_SENDER_PASSWORD;
-  session.login.user_domain = "";
+    // Setup user rules
+    String var = "$userId";
+    String val = "($userId === auth.uid && auth.token.premium_account === true && auth.token.admin === true)";
+    Firebase.setReadWriteRules(firebaseData, "/", var, val, val, FIREBASE_DATABASE_SECRET);
 }
 
-static uint32_t lastCheck = uint32_t(0);
+void firebaseConnectionSetup(const char *apiKey, const char *host) {
+    firebaseConfig.api_key = apiKey;
+    firebaseConfig.database_url = host;
+    firebaseConfig.token_status_callback = tokenStatusCallback;
 
-void loop() {
-  DateTime now = rtc.now();
+    Firebase.reconnectNetwork(true);
+}
 
-  bool newData = false;
-  // Check if 30 seconds have passed
-  if (now.unixtime() - lastCheck >= uint32_t(60 * 0.5)) {
-    lastCheck = rtc.now().unixtime();
-    Serial.println("30sec have passed. Executing task.");
+void mailSetup(const char *host, const int port, const char *email, const char *password) {
+    config.server.host_name = SMTP_HOST;
+    config.server.port = SMTP_PORT;
+    config.login.email = AUTHOR_EMAIL;
+    config.login.password = AUTHOR_PASSWORD;
+    config.login.user_domain = F("127.0.0.1");
 
-    while (SerialGPS.available()){
-      char c = SerialGPS.read();
-      // Serial.write(c); // uncomment this line if you want to see the GPS data flowing
-      if (gps.encode(c)) // Did a new valid sentence come in?
-        newData = true;
+    config.time.ntp_server = F("pool.ntp.org,time.nist.gov");
+    config.time.gmt_offset = 2;
+    config.time.day_light_offset = 0;
+}
+
+SMTP_Message prepareSmtpMessage(String currentLat, String currentLng, String firebaseLat, String firebaseLng, String distance, String mapsLink, String mapsDirections) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Current coordinates: %s, %s\nFirebase coordinates: %s, %s\nDifference: %s meters\nMaps: %s\nDirections: %s\n", currentLat, currentLng, firebaseLat, firebaseLng, distance, mapsLink, mapsDirections);
+        
+    SMTP_Message message;
+
+    message.sender.name = F("ESP Vehicle");
+    message.sender.email = AUTHOR_EMAIL;
+    message.subject = F("Change in coordinates");
+    message.addRecipient(F("user"), RECIPIENT_EMAIL);
+    message.text.content = F(msg);
+    message.text.charSet = F("us-ascii");
+
+    return message;
+}
+
+void setup() {
+    Serial.begin(115200);
+    SerialGPS.begin(9600, SERIAL_8N1, RX2, TX2);
+    Serial.println();
+
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    Serial.println("Connecting to Wi-Fi...");
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(500);
     }
-    
-    if (newData) {
-      double currentLat = gps.location.lat();
-      double currentLng = gps.location.lng();
+    Serial.println("Finished connecting to Wi-Fi.");
 
-      Serial.println("Positions:");
-      Serial.println(String(currentLat, 7));
-      Serial.println(String(currentLng, 7));
-      Serial.println(String(gps.satellites.value()));
-      Serial.println();
-
-      task();
+    Serial.println("Connecting to RTC...");
+    if (!rtc.begin()) {
+        Serial.println("Couldn't find RTC");
+        Serial.flush();
+        while (1) delay(10);
     }
-  } 
+    Serial.println("Finished connecting to RTC.");
+
+    if (!rtc.isrunning()) {
+        Serial.println("RTC is NOT running, let's set the time!");
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+ 
+    // Initialize Firebase
+    Serial.println("Connecting to Firebase...");
+    firebaseConnectionSetup(FIREBASE_AUTH, FIREBASE_HOST);
+    firebaseData.setBSSLBufferSize(4096 /* Rx buffer size in bytes from 512 - 16384 */, 1024 /* Tx buffer size in bytes from 512 - 16384 */);
+    firebaseSignIn(FIREBASE_USER, FIREBASE_PASSOWRD);
+    Serial.println("Finished Firebase initialization.");
+
+    Serial.println();
+    Serial.print("Connected with IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.println();
+
+    // Initialize email client
+    Serial.println("Setting up mail client...");
+    MailClient.networkReconnect(true);
+    smtp.debug(1);
+    smtp.callback(smtpCallback);
+    mailSetup(SMTP_HOST, SMTP_PORT, AUTHOR_EMAIL, AUTHOR_PASSWORD);
+    Serial.println("Finished mail client setup.");
+
+    if (Firebase.ready()) {
+        Serial.printf("Using path: %s\n", FIREBASE_ROOT_PATH);
+
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/latitude")) {
+            Serial.printf("Set latitude... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/latitude", "0") ? "ok" : firebaseData.errorReason().c_str());
+        }
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude")) {
+            Serial.printf("Set longitude... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude", "0") ? "ok" : firebaseData.errorReason().c_str());
+        }
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/maps")) {
+            Serial.printf("Set maps... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/maps", "placeholder") ? "ok" : firebaseData.errorReason().c_str());
+        }
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/directions")) {
+            Serial.printf("Set maps directions... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/directions", "placeholder") ? "ok" : firebaseData.errorReason().c_str());
+        }
+    }
+}
+
+void printGpsData() {
+    Serial.print(F("LOCATION   Fix Age="));
+    Serial.print(gps.location.age());
+    Serial.print(F("ms Raw Lat="));
+    Serial.print(gps.location.rawLat().negative ? "-" : "+");
+    Serial.print(gps.location.rawLat().deg);
+    Serial.print("[+");
+    Serial.print(gps.location.rawLat().billionths);
+    Serial.print(F(" billionths],  Raw Long="));
+    Serial.print(gps.location.rawLng().negative ? "-" : "+");
+    Serial.print(gps.location.rawLng().deg);
+    Serial.print("[+");
+    Serial.print(gps.location.rawLng().billionths);
+    Serial.print(F(" billionths],  Lat="));
+    Serial.print(gps.location.lat(), 9);
+    Serial.print(F(" Long="));
+    Serial.println(gps.location.lng(), 9);
+    Serial.printf("Satelites %s\n", String(gps.satellites.value()));
 }
 
 void task() {
     double currentLat = gps.location.lat();
     double currentLng = gps.location.lng();
-
+    printGpsData();
+    
     // Get Firebase coordinates
-    double firebaseLat = Firebase.getFloat(firebaseData, "/coordinates/latitude");
-    double firebaseLng = Firebase.getFloat(firebaseData, "/coordinates/longitude");
+    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/latitude");
+    String firebaseLat = firebaseData.to<const char *>();
+    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude");
+    String firebaseLng = firebaseData.to<const char *>();
+    String mapsLink = "https://www.google.com/maps/@" + String(currentLat, 9) + "," + String(currentLng, 9);
+    String mapsDirections = "https://www.google.com/maps/dir/?api=1&destination=" + String(currentLat, 9) + "," + String(currentLng, 9);
 
     // Compare coordinates
-    double distance = TinyGPSPlus::distanceBetween(currentLat, currentLng, firebaseLat, firebaseLng);
-    if (distance >= 5) {
-      if (!sendEmail(currentLat, currentLng, firebaseLat, firebaseLng, distance)) {
-        Serial.println("Faield sending Email");
-      }
+    double distance = TinyGPSPlus::distanceBetween(currentLat, currentLng, firebaseLat.toDouble(), firebaseLng.toDouble());
+    if (distance >= DISTANCE) {
+        Serial.printf("Over %dm away", DISTANCE);
+
+        // Prepare message
+        SMTP_Message message = prepareSmtpMessage(String(currentLat, 9), String(currentLng, 9), firebaseLat, firebaseLng, String(distance), mapsLink, mapsDirections);
+
+        Serial.println();
+        Serial.println("Sending Email...");
+
+        if (!smtp.isLoggedIn()) {
+            /* Set the TCP response read timeout in seconds */
+            smtp.setTCPTimeout(10);
+
+            if (!smtp.connect(&config)) {
+                MailClient.printf("Connection error, Status Code: %d, Error Code: %d, Reason: %s\n", smtp.statusCode(), smtp.errorCode(), smtp.errorReason().c_str());
+                goto exit;
+            }
+
+            if (!smtp.isLoggedIn()) {
+                Serial.println("Error, Not yet logged in.");
+                goto exit;
+            } else {
+                if (smtp.isAuthenticated())
+                    Serial.println("Successfully logged in.");
+                else
+                    Serial.println("Connected with no Auth.");
+            }
+        }
+
+        if (!MailClient.sendMail(&smtp, &message, false))
+            MailClient.printf("Error, Status Code: %d, Error Code: %d, Reason: %s\n", smtp.statusCode(), smtp.errorCode(), smtp.errorReason().c_str());
+
+    exit:
+
+        heapInfo.collect();
+        heapInfo.print();
     }
 
     // Update Firebase
-    Firebase.setFloat(firebaseData, "/coordinates/latitude", currentLat);
-    Firebase.setFloat(firebaseData, "/coordinates/longitude", currentLng);
-    String maps = "https://www.google.com/maps/@" + String(currentLat, 7) + "," + String(currentLng, 7);
-    Firebase.setString(firebaseData, "/coordinates/maps", maps);
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/latitude", String(currentLat, 9));
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude", String(currentLng, 9));
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/maps", mapsLink);
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/directions", mapsDirections);
 }
 
-bool sendEmail(double currentLat, double currentLng, double firebaseLat, double firebaseLng, double distance) {
-  SMTP_Message message;
-  String messageStr = "Current coordinates: " + String(currentLat, 7) + ", " + String(currentLng, 7) +
-                   "\nFirebase coordinates: " + String(firebaseLat, 7) + ", " + String(firebaseLng, 7) +
-                   "\nDifference: " + String(distance) + " meters";
-  /* Set the message headers */
-  message.sender.name = "ESP";
-  message.sender.email = EMAIL_SENDER;
-  message.subject = "ESP Test Email";
-  message.addRecipient("Sara", EMAIL_RECIPIENT);
-  /*Send HTML message*/
-  String htmlMsg = "<div style=\"color:#2f4468;\"><h1>Hello World!</h1><p>- Sent from ESP board</p></div>";
-  message.html.content = htmlMsg.c_str();
-  message.html.content = htmlMsg.c_str();
-  message.text.charSet = "us-ascii";
-  message.html.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
-  Serial.println("Over 5m away");
-  Serial.println(messageStr);
-  if (!smtp.connect(&session)) {
-      return false;
-  }
-  if (!MailClient.sendMail(&smtp, &message)) {
-    Serial.println("Error sending Email, " + smtp.errorReason());
-    return false;
-  }
+static uint32_t lastCheckForTask = uint32_t(0);
 
-  return true;
+void loop() {
+    DateTime now = rtc.now();
+    bool newData = false;
+
+    // Check if 30 seconds have passed
+    if (now.unixtime() - lastCheckForTask >= uint32_t(60 * 0.5)) {
+        if (!Firebase.ready()) {
+            Serial.println("Firebase was not ready. Will reauthenticate.");
+        }
+
+        lastCheckForTask = rtc.now().unixtime();
+        Serial.printf("\n30sec have passed. Executing task.\n");
+
+        while (SerialGPS.available()) {
+            char c = SerialGPS.read();
+
+            if (gps.encode(c)) // Did a new valid sentence come in?
+                newData = true;
+        }
+        
+        if (newData) {
+            task();
+        }
+    } 
 }
 
-void smtpCallback(SMTP_Status status){
-  /* Print the current status */
-  Serial.println(status.info());
 
-  /* Print the sending result */
-  if (status.success()){
-    Serial.println("----------------");
-    ESP_MAIL_PRINTF("Message sent success: %d\n", status.completedCount());
-    ESP_MAIL_PRINTF("Message sent failled: %d\n", status.failedCount());
-    Serial.println("----------------\n");
-    struct tm dt;
+/* Callback function to get the Email sending status */
+void smtpCallback(SMTP_Status status) {
 
-    for (size_t i = 0; i < smtp.sendingResult.size(); i++){
-      /* Get the result item */
-      SMTP_Result result = smtp.sendingResult.getItem(i);
-      time_t ts = (time_t)result.timestamp;
-      localtime_r(&ts, &dt);
+    Serial.println(status.info());
 
-      ESP_MAIL_PRINTF("Message No: %d\n", i + 1);
-      ESP_MAIL_PRINTF("Status: %s\n", result.completed ? "success" : "failed");
-      ESP_MAIL_PRINTF("Date/Time: %d/%d/%d %d:%d:%d\n", dt.tm_year + 1900, dt.tm_mon + 1, dt.tm_mday, dt.tm_hour, dt.tm_min, dt.tm_sec);
-      ESP_MAIL_PRINTF("Recipient: %s\n", result.recipients.c_str());
-      ESP_MAIL_PRINTF("Subject: %s\n", result.subject.c_str());
+    if (status.success()) {
+
+        Serial.println("----------------");
+        MailClient.printf("Message sent success: %d\n", status.completedCount());
+        MailClient.printf("Message sent failed: %d\n", status.failedCount());
+        Serial.println("----------------\n");
+
+        for (size_t i = 0; i < smtp.sendingResult.size(); i++)
+        {
+            SMTP_Result result = smtp.sendingResult.getItem(i);
+
+            MailClient.printf("Message No: %d\n", i + 1);
+            MailClient.printf("Status: %s\n", result.completed ? "success" : "failed");
+            MailClient.printf("Date/Time: %s\n", MailClient.Time.getDateTimeString(result.timestamp, "%B %d, %Y %H:%M:%S").c_str());
+            MailClient.printf("Recipient: %s\n", result.recipients.c_str());
+            MailClient.printf("Subject: %s\n", result.subject.c_str());
+        }
+        Serial.println("----------------\n");
+
+        smtp.sendingResult.clear();
     }
-    Serial.println("----------------\n");
-  }
 }
