@@ -33,6 +33,7 @@ RTC_DS1307 rtc;
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(1);
 #define DISTANCE 1
+#define LOOP_TIMEOUT_SECONDS 30
 
 // Firebase credentials
 #define FIREBASE_HOST ""
@@ -147,19 +148,25 @@ void setup() {
     Serial.println("Finished mail client setup.");
 
     if (Firebase.ready()) {
-        Serial.printf("Using path: %s\n", FIREBASE_ROOT_PATH);
+        Serial.printf("Using Firebase root path: %s\n", FIREBASE_ROOT_PATH);
 
-        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/latitude")) {
-            Serial.printf("Set latitude... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/latitude", "0") ? "ok" : firebaseData.errorReason().c_str());
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/latitude")) {
+            Serial.printf("Set latitude... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/latitude", "0") ? "ok" : firebaseData.errorReason().c_str());
         }
-        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude")) {
-            Serial.printf("Set longitude... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude", "0") ? "ok" : firebaseData.errorReason().c_str());
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/longitude")) {
+            Serial.printf("Set longitude... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/longitude", "0") ? "ok" : firebaseData.errorReason().c_str());
         }
-        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/maps")) {
-            Serial.printf("Set maps... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/maps", "placeholder") ? "ok" : firebaseData.errorReason().c_str());
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/pin")) {
+            Serial.printf("Set maps... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/pin", "placeholder") ? "ok" : firebaseData.errorReason().c_str());
         }
-        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/directions")) {
-            Serial.printf("Set maps directions... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/directions", "placeholder") ? "ok" : firebaseData.errorReason().c_str());
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/directions")) {
+            Serial.printf("Set maps directions... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/directions", "placeholder") ? "ok" : firebaseData.errorReason().c_str());
+        }
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "timestamp")) {
+            Serial.printf("Set maps directions... %s\n", Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "timestamp", "placeholder") ? "ok" : firebaseData.errorReason().c_str());
+        }
+        if (!Firebase.pathExisted(firebaseData, String(FIREBASE_ROOT_PATH) + "shouldNotify")) {
+            Serial.printf("Set maps directions... %s\n", Firebase.setBool(firebaseData, String(FIREBASE_ROOT_PATH) + "shouldNotify", false) ? "ok" : firebaseData.errorReason().c_str());
         }
     }
 }
@@ -184,28 +191,32 @@ void printGpsData() {
     Serial.printf("Satelites %s\n", String(gps.satellites.value()));
 }
 
-void task() {
+void task(String ts) {
     double currentLat = gps.location.lat();
     double currentLng = gps.location.lng();
-    printGpsData();
     
     // Get Firebase coordinates
-    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/latitude");
-    String firebaseLat = firebaseData.to<const char *>();
-    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude");
-    String firebaseLng = firebaseData.to<const char *>();
+    String firebaseLat = getFirebaseLat();
+    String firebaseLng = getFirebaseLng();
+    bool shouldNotify = getFirebaseShouldNotify();
+
+    // Build link strings
     String mapsLink = "https://www.google.com/maps/search/?api=1&query=" + String(currentLat, 9) + "," + String(currentLng, 9);
     String mapsDirections = "https://www.google.com/maps/dir/?api=1&destination=" + String(currentLat, 9) + "," + String(currentLng, 9);
 
     // Compare coordinates
     double distance = TinyGPSPlus::distanceBetween(currentLat, currentLng, firebaseLat.toDouble(), firebaseLng.toDouble());
     if (distance >= DISTANCE) {
-        Serial.printf("Over %dm away", DISTANCE);
+        if (!shouldNotify) {
+            Serial.printf("Over %dm away. But a notification should not be generated. Exiting...\n", DISTANCE);
+            return;
+        }
+
+        Serial.printf("Over %dm away. Proceed with notification...\n", DISTANCE);
 
         // Prepare message
         SMTP_Message message = prepareSmtpMessage(String(currentLat, 9), String(currentLng, 9), firebaseLat, firebaseLng, String(distance), mapsLink, mapsDirections);
 
-        Serial.println();
         Serial.println("Sending Email...");
 
         if (!smtp.isLoggedIn()) {
@@ -232,16 +243,35 @@ void task() {
             MailClient.printf("Error, Status Code: %d, Error Code: %d, Reason: %s\n", smtp.statusCode(), smtp.errorCode(), smtp.errorReason().c_str());
 
     exit:
-
         heapInfo.collect();
         heapInfo.print();
     }
 
-    // Update Firebase
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/latitude", String(currentLat, 9));
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude", String(currentLng, 9));
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/maps", mapsLink);
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/directions", mapsDirections);
+    updateFirebaseValues(mapsLink, mapsDirections, ts);
+}
+
+void updateFirebaseValues(String mapsLink, String mapsDirections, String ts) {
+    Serial.println("Updating Firebase values...");
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/latitude", String(gps.location.lat(), 9));
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/longitude", String(gps.location.lat(), 9));
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/pin", mapsLink);
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/directions", mapsDirections);
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "timestamp", ts);
+}
+
+String getFirebaseLat() {
+    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/latitude");
+    return firebaseData.to<const char *>(); 
+}
+
+String getFirebaseLng() {
+    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/longitude");
+    return firebaseData.to<const char *>(); 
+}
+
+bool getFirebaseShouldNotify() {
+    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "shouldNotify");
+    return firebaseData.to<bool>(); 
 }
 
 static uint32_t lastCheckForTask = uint32_t(0);
@@ -251,35 +281,36 @@ void loop() {
     bool newData = false;
 
     // Check if 30 seconds have passed
-    if (now.unixtime() - lastCheckForTask >= uint32_t(60 * 0.5)) {
+    if (now.unixtime() - lastCheckForTask >= uint32_t(LOOP_TIMEOUT_SECONDS)) {
+        lastCheckForTask = rtc.now().unixtime();
+
         if (!Firebase.ready()) {
-            Serial.println("Firebase was not ready. Will reauthenticate.");
+            Serial.println("Firebase was not ready. Will reauthenticate...");
         }
 
-        lastCheckForTask = rtc.now().unixtime();
-        Serial.printf("\n30sec have passed. Executing task.\n");
+        Serial.printf("\n%dsec have passed.\n", LOOP_TIMEOUT_SECONDS);
 
         while (SerialGPS.available()) {
             char c = SerialGPS.read();
 
-            if (gps.encode(c)) // Did a new valid sentence come in?
+            if (gps.encode(c)) {
                 newData = true;
+            }
         }
         
         if (newData) {
-            task();
+            Serial.println("New data. Processing it...");
+            printGpsData();
+
+            task(now.timestamp());
         }
     } 
 }
 
-
 /* Callback function to get the Email sending status */
 void smtpCallback(SMTP_Status status) {
-
-    Serial.println(status.info());
-
+    Serial.println("Email callback...");
     if (status.success()) {
-
         Serial.println("----------------");
         MailClient.printf("Message sent success: %d\n", status.completedCount());
         MailClient.printf("Message sent failed: %d\n", status.failedCount());
