@@ -86,16 +86,14 @@ void mailSetup(const char *host, const int port, const char *email, const char *
 }
 
 SMTP_Message prepareSmtpMessage(String currentLat, String currentLng, String firebaseLat, String firebaseLng, String distance, String mapsLink, String mapsDirections) {
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Current coordinates: %s, %s\nFirebase coordinates: %s, %s\nDifference: %s meters\nMaps: %s\nDirections: %s\n", currentLat, currentLng, firebaseLat, firebaseLng, distance, mapsLink, mapsDirections);
-        
+    String msg = "Current coordinates: " + currentLat + ", " + currentLng + "\n" + "Firebase coordinates: " + firebaseLat + ", " + firebaseLng + "\n" + "Difference: " + distance + "meters\nMaps: " + mapsLink + "\nDirections: " + mapsDirections;
     SMTP_Message message;
 
     message.sender.name = F("ESP Vehicle");
     message.sender.email = AUTHOR_EMAIL;
     message.subject = F("Change in coordinates");
     message.addRecipient(F("user"), RECIPIENT_EMAIL);
-    message.text.content = F(msg);
+    message.text.content = msg;
     message.text.charSet = F("us-ascii");
 
     return message;
@@ -196,7 +194,7 @@ void task() {
     String firebaseLat = firebaseData.to<const char *>();
     Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "/coordinates/longitude");
     String firebaseLng = firebaseData.to<const char *>();
-    String mapsLink = "https://www.google.com/maps/@" + String(currentLat, 9) + "," + String(currentLng, 9);
+    String mapsLink = "https://www.google.com/maps/search/?api=1&query=" + String(currentLat, 9) + "," + String(currentLng, 9);
     String mapsDirections = "https://www.google.com/maps/dir/?api=1&destination=" + String(currentLat, 9) + "," + String(currentLng, 9);
 
     // Compare coordinates
