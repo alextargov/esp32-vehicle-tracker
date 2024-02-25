@@ -122,10 +122,8 @@ void setup() {
     }
     Serial.println("Finished connecting to RTC.");
 
-    if (!rtc.isrunning()) {
-        Serial.println("RTC is NOT running, let's set the time!");
-        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    }
+    Serial.println("Setting current time for the RTC.");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
  
     // Initialize Firebase
     Serial.println("Connecting to Firebase...");
@@ -171,6 +169,30 @@ void setup() {
     }
 }
 
+void updateFirebaseValues(String mapsLink, String mapsDirections, String ts) {
+    Serial.println("Updating Firebase values...");
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/latitude", String(gps.location.lat(), 9));
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/longitude", String(gps.location.lat(), 9));
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/pin", mapsLink);
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/directions", mapsDirections);
+    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "timestamp", ts);
+}
+
+String getFirebaseLat() {
+    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/latitude");
+    return firebaseData.to<const char *>(); 
+}
+
+String getFirebaseLng() {
+    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/longitude");
+    return firebaseData.to<const char *>(); 
+}
+
+bool getFirebaseShouldNotify() {
+    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "shouldNotify");
+    return firebaseData.to<bool>(); 
+}
+
 void printGpsData() {
     Serial.print(F("LOCATION   Fix Age="));
     Serial.print(gps.location.age());
@@ -206,6 +228,9 @@ void task(String ts) {
 
     // Compare coordinates
     double distance = TinyGPSPlus::distanceBetween(currentLat, currentLng, firebaseLat.toDouble(), firebaseLng.toDouble());
+    
+    updateFirebaseValues(mapsLink, mapsDirections, ts);
+
     if (distance >= DISTANCE) {
         if (!shouldNotify) {
             Serial.printf("Over %dm away. But a notification should not be generated. Exiting...\n", DISTANCE);
@@ -246,32 +271,6 @@ void task(String ts) {
         heapInfo.collect();
         heapInfo.print();
     }
-
-    updateFirebaseValues(mapsLink, mapsDirections, ts);
-}
-
-void updateFirebaseValues(String mapsLink, String mapsDirections, String ts) {
-    Serial.println("Updating Firebase values...");
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/latitude", String(gps.location.lat(), 9));
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/longitude", String(gps.location.lat(), 9));
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/pin", mapsLink);
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "maps/directions", mapsDirections);
-    Firebase.setString(firebaseData, String(FIREBASE_ROOT_PATH) + "timestamp", ts);
-}
-
-String getFirebaseLat() {
-    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/latitude");
-    return firebaseData.to<const char *>(); 
-}
-
-String getFirebaseLng() {
-    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "coordinates/longitude");
-    return firebaseData.to<const char *>(); 
-}
-
-bool getFirebaseShouldNotify() {
-    Firebase.getString(firebaseData, String(FIREBASE_ROOT_PATH) + "shouldNotify");
-    return firebaseData.to<bool>(); 
 }
 
 static uint32_t lastCheckForTask = uint32_t(0);
@@ -289,6 +288,7 @@ void loop() {
         }
 
         Serial.printf("\n%dsec have passed.\n", LOOP_TIMEOUT_SECONDS);
+        printGpsData();
 
         while (SerialGPS.available()) {
             char c = SerialGPS.read();
